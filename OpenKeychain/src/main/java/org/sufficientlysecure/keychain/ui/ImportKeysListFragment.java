@@ -202,7 +202,7 @@ public class ImportKeysListFragment extends Fragment implements
         mRecyclerView.setLayoutManager(layoutManager);
 
         // Create an empty adapter we will use to display the loaded data.
-        mAdapter = new ImportKeysAdapter(mActivity, mCallback, nonInteractive);
+        mAdapter = new ImportKeysAdapter(mActivity, this, mCallback, nonInteractive);
         mRecyclerView.setAdapter(mAdapter);
 
         if (dataUri != null || bytes != null) {

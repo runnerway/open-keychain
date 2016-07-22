@@ -21,6 +21,7 @@ import android.content.Context;
 import android.content.res.Resources;
 import android.databinding.DataBindingUtil;
 import android.graphics.Color;
+import android.support.v4.app.Fragment;
 import android.support.v7.widget.RecyclerView;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -28,6 +29,7 @@ import android.view.ViewGroup;
 import android.widget.TextView;
 
 import org.openintents.openpgp.util.OpenPgpUtils;
+import org.sufficientlysecure.keychain.Constants;
 import org.sufficientlysecure.keychain.R;
 import org.sufficientlysecure.keychain.databinding.ImportKeysListItemBinding;
 import org.sufficientlysecure.keychain.keyimport.ImportKeysListEntry;
@@ -37,12 +39,21 @@ import org.sufficientlysecure.keychain.keyimport.processing.CloudLoaderState;
 import org.sufficientlysecure.keychain.keyimport.processing.ImportKeysListener;
 import org.sufficientlysecure.keychain.keyimport.processing.LoaderState;
 import org.sufficientlysecure.keychain.operations.ImportOperation;
+import org.sufficientlysecure.keychain.operations.results.ImportKeyResult;
+import org.sufficientlysecure.keychain.pgp.CanonicalizedKeyRing;
+import org.sufficientlysecure.keychain.pgp.CanonicalizedPublicKeyRing;
+import org.sufficientlysecure.keychain.pgp.CanonicalizedSecretKeyRing;
 import org.sufficientlysecure.keychain.pgp.KeyRing;
+import org.sufficientlysecure.keychain.service.ImportKeyringParcel;
+import org.sufficientlysecure.keychain.ui.base.CryptoOperationHelper;
 import org.sufficientlysecure.keychain.ui.util.FormattingUtils;
 import org.sufficientlysecure.keychain.ui.util.Highlighter;
 import org.sufficientlysecure.keychain.ui.util.KeyFormattingUtils;
 import org.sufficientlysecure.keychain.ui.util.KeyFormattingUtils.State;
+import org.sufficientlysecure.keychain.util.Log;
+import org.sufficientlysecure.keychain.util.ParcelableFileCache;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -50,17 +61,23 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 
-public class ImportKeysAdapter extends RecyclerView.Adapter<ImportKeysAdapter.ViewHolder> {
+public class ImportKeysAdapter extends RecyclerView.Adapter<ImportKeysAdapter.ViewHolder> implements
+        CryptoOperationHelper.Callback<ImportKeyringParcel, ImportKeyResult> {
 
     private Context mContext;
+    private Fragment mFragment;
     private ImportKeysListener mListener;
     private boolean mNonInteractive;
 
     private LoaderState mLoaderState;
     private List<ImportKeysListEntry> mData;
 
-    public ImportKeysAdapter(Context mContext, ImportKeysListener listener, boolean mNonInteractive) {
-        this.mContext = mContext;
+    private String mKeyserver = null;
+    private ArrayList<ParcelableKeyRing> mKeyList = null;
+
+    public ImportKeysAdapter(Context context, Fragment fragment, ImportKeysListener listener, boolean mNonInteractive) {
+        this.mContext = context;
+        this.mFragment = fragment;
         this.mListener = listener;
         this.mNonInteractive = mNonInteractive;
     }
@@ -158,12 +175,22 @@ public class ImportKeysAdapter extends RecyclerView.Adapter<ImportKeysAdapter.Vi
                 }
             }
         });
+
         b.expand.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 boolean hidden = b.extraContainer.getVisibility() == View.GONE;
                 b.extraContainer.setVisibility(hidden ? View.VISIBLE : View.GONE);
                 b.expand.animate().rotation(hidden ? 180 : 0).start();
+
+                if (hidden) {
+                    if (mLoaderState instanceof BytesLoaderState) {
+                        getKey(new ParcelableKeyRing(entry.getEncodedRing()));
+                    } else if (mLoaderState instanceof CloudLoaderState) {
+                        getKey(new ParcelableKeyRing(entry.getFingerprintHex(), entry.getKeyIdHex(),
+                                entry.getKeybaseName(), entry.getFbUsername()));
+                    }
+                }
             }
         });
 
@@ -234,6 +261,64 @@ public class ImportKeysAdapter extends RecyclerView.Adapter<ImportKeysAdapter.Vi
     @Override
     public int getItemCount() {
         return mData != null ? mData.size() : 0;
+    }
+
+    public void getKey(ParcelableKeyRing keyRing) {
+        Log.d(Constants.TAG, "getKey started");
+        if (mLoaderState instanceof BytesLoaderState) {
+            // instead of giving the entries by Intent extra, cache them into a
+            // file to prevent Java Binder problems on heavy imports
+            // read FileImportCache for more info.
+            try {
+                // We parcel this iteratively into a file - anything we can
+                // display here, we should be able to import.
+                ParcelableFileCache<ParcelableKeyRing> cache =
+                        new ParcelableFileCache<>(mContext, ImportOperation.CACHE_FILE_NAME);
+                cache.writeCache(keyRing);
+            } catch (IOException e) {
+                Log.e(Constants.TAG, "Problem writing cache file", e);
+                //TODO Notify.create(mContext, "Problem writing cache file!", Notify.Style.ERROR).show();
+                return;
+            }
+        } else if (mLoaderState instanceof CloudLoaderState) {
+            ArrayList<ParcelableKeyRing> keys = new ArrayList<>();
+            keys.add(keyRing);
+
+            mKeyList = keys;
+            mKeyserver = ((CloudLoaderState) mLoaderState).mCloudPrefs.keyserver;
+        }
+
+        CryptoOperationHelper<ImportKeyringParcel, ImportKeyResult> operationHelper;
+        operationHelper = new CryptoOperationHelper(1, mFragment, this, R.string.progress_importing);
+        operationHelper.cryptoOperation();
+    }
+
+    @Override
+    public ImportKeyringParcel createOperationInput() {
+        return new ImportKeyringParcel(mKeyList, mKeyserver, true);
+    }
+
+    @Override
+    public void onCryptoOperationSuccess(ImportKeyResult result) {
+        ArrayList<CanonicalizedPublicKeyRing> canPublicKeyRings = result.mCanonicalizedPublicKeyRings;
+        ArrayList<CanonicalizedSecretKeyRing> canSecretKeyRings = result.mCanonicalizedSecretKeyRings;
+        Log.d("onCryptoOperationSuccess", "SizeSecret: " + canSecretKeyRings.size() + "\n"
+                + "SizePublic: " + canPublicKeyRings.size());
+    }
+
+    @Override
+    public void onCryptoOperationCancelled() {
+
+    }
+
+    @Override
+    public void onCryptoOperationError(ImportKeyResult result) {
+
+    }
+
+    @Override
+    public boolean onCryptoSetProgress(String msg, int progress, int max) {
+        return false;
     }
 
 }
